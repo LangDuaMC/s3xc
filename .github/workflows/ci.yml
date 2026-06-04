@@ -1,0 +1,289 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      image_name: ${{ steps.meta.outputs.image_name }}
+      docker_ref_tag: ${{ steps.meta.outputs.docker_ref_tag }}
+      pack_base: ${{ steps.meta.outputs.pack_base }}
+      publish_docker: ${{ steps.meta.outputs.publish_docker }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute workflow metadata
+        id: meta
+        shell: bash
+        run: |
+          version="$(
+            cargo metadata --no-deps --format-version 1 | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for pkg in data.get("packages", []):
+              if pkg.get("name") == "s3xc":
+                  print(pkg.get("version", ""))
+                  break
+          '
+          )"
+          gitsha="$(git rev-parse --short=12 HEAD)"
+          pack_base="s3xc_${version}+${gitsha}"
+          image_name="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          ref_name="${{ github.ref_name }}"
+          ref_tag="$(printf '%s' "${ref_name}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')"
+          
+          echo "image_name=${image_name}" >> "$GITHUB_OUTPUT"
+          echo "docker_ref_tag=${ref_tag}" >> "$GITHUB_OUTPUT"
+          echo "pack_base=${pack_base}" >> "$GITHUB_OUTPUT"
+          
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "publish_docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish_docker=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux_amd64_build:
+    runs-on: ubuntu-latest
+    needs: prep
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Cargo Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-amd64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-amd64-
+
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Upload amd64 binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: target/${{ env.TARGET }}/release/s3xc
+          if-no-files-found: error
+          overwrite: true
+
+  linux_arm64_build:
+    runs-on: ubuntu-24.04-arm
+    needs: prep
+    env:
+      TARGET: aarch64-unknown-linux-musl
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Cache Cargo Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arm64-
+
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Upload arm64 binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: target/${{ env.TARGET }}/release/s3xc
+          if-no-files-found: error
+          overwrite: true
+
+  integration_test:
+    runs-on: ubuntu-latest
+    needs: [prep, linux_amd64_build]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Linux amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: artifacts/linux-amd64
+
+      - name: Install test dependencies (awscli, netcat, mc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends awscli netcat-openbsd || \
+            (sudo apt-get install -y --no-install-recommends python3-pip netcat-openbsd && \
+             pip3 install awscli --break-system-packages)
+          curl -LO https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          sudo mv mc /usr/local/bin/
+
+      - name: Start MinIO Server (Upstream Backend)
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=admin \
+            -e MINIO_ROOT_PASSWORD=password \
+            minio/minio server /data --console-address ":9001"
+
+      - name: Wait for MinIO to be healthy
+        run: |
+          for i in $(seq 1 20); do
+            if mc alias set healthcheck http://localhost:9000 admin password 2>/dev/null \
+               && mc ls healthcheck 2>/dev/null; then
+              echo "MinIO is ready"
+              exit 0
+            fi
+            echo "Waiting for MinIO... ($i/20)"
+            sleep 2
+          done
+          echo "MinIO failed to become ready"
+          docker logs minio 2>&1 | tail -30
+          exit 1
+
+      - name: Stage Docker payload and build local container
+        run: |
+          mkdir -p docker/linux-amd64
+          cp artifacts/linux-amd64/s3xc docker/linux-amd64/s3xc
+          docker build -t s3xc:local -f Dockerfile.copy --build-arg TARGETARCH=amd64 .
+
+      - name: Start s3xc Proxy
+        run: |
+          docker run -d --name s3xc \
+            -p 8080:8080 \
+            --net=host \
+            -e S3C_BACKEND_ENDPOINT=http://localhost:9000 \
+            -e S3C_BACKEND_REGION=us-east-1 \
+            -e S3C_BACKEND_PATH_SCHEME=true \
+            -e S3C_BIND_ADDR=0.0.0.0:8080 \
+            -e S3C_CACHE_DIR=/var/cache/s3xc \
+            -e S3C_CHUNK_SIZE=1048576 \
+            -e S3C_CREDENTIALS="apple:applepieiskey;blossom:blossomcakeiskey;proxy_user:proxy_password" \
+            -e S3C_BACKEND_ACCESS_KEY=admin \
+            -e S3C_BACKEND_SECRET_KEY=password \
+            -e RUST_LOG=debug \
+            s3xc:local
+
+      - name: Run Integration Tests
+        run: |
+          export AWS_ACCESS_KEY_ID=proxy_user
+          export AWS_SECRET_ACCESS_KEY=proxy_password
+          export AWS_DEFAULT_REGION=us-east-1
+          ./tests/integration_test.sh
+
+      - name: Dump s3xc Logs
+        if: always()
+        run: docker logs s3xc 2>&1 | tail -200
+
+      - name: Cleanup Test Containers
+        if: always()
+        run: |
+          docker stop s3xc minio || true
+          docker rm s3xc minio || true
+
+  docker_publish:
+    runs-on: ubuntu-latest
+    needs: [prep, linux_amd64_build, linux_arm64_build, integration_test]
+    if: needs.prep.outputs.publish_docker == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Linux amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: artifacts/linux-amd64
+
+      - name: Download Linux arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: artifacts/linux-arm64
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage Docker payload
+        run: |
+          mkdir -p docker/linux-amd64 docker/linux-arm64
+          cp artifacts/linux-amd64/s3xc docker/linux-amd64/s3xc
+          cp artifacts/linux-arm64/s3xc docker/linux-arm64/s3xc
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.copy
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ needs.prep.outputs.image_name }}:${{ needs.prep.outputs.docker_ref_tag }}
+            ${{ env.REGISTRY }}/${{ needs.prep.outputs.image_name }}:latest
+            ${{ env.REGISTRY }}/${{ needs.prep.outputs.image_name }}:sha-${{ github.sha }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ needs.prep.outputs.image_name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

@@ -1,0 +1,22 @@
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy pre-built binary based on TARGETARCH (amd64 / arm64)
+COPY docker/linux-${TARGETARCH}/s3xc /usr/local/bin/s3xc
+
+RUN chmod 0755 /usr/local/bin/s3xc
+
+# Create cache directory
+RUN mkdir -p /var/cache/s3xc
+
+# Expose HTTP port
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/s3xc"]
